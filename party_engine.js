@@ -948,6 +948,12 @@ engineHooks.beforeEndTurn = (state, player) => {
   }
   // 未處理的起點買星／黑市滿包替換不得跨回合殘留，否則會鎖住下一位玩家。
   if (ext.starOffer?.playerId === player.id) ext.starOffer = null;
+  // 命運輪盤、內線交易、投資邀請和事件提示也一樣：殘留的話下一位玩家的二選一視窗永遠不會出現。
+  // 已付款的輪盤直接套用結果；沒回應的邀請視為放棄；事件效果早已套用，提示直接關掉。
+  if (ext.wheelPending?.playerId === player.id) extResolveWheel(state, { playerId: player.id, at: ext.wheelPending.at });
+  if (ext.insiderOffer?.playerId === player.id) ext.insiderOffer = null;
+  if (ext.investOffer?.playerId === player.id) ext.investOffer = null;
+  if (ext.eventPrompt?.playerId === player.id) ext.eventPrompt = null;
   if (ext.replaceOffer?.playerId === player.id) {
     const offer = ext.replaceOffer;
     ext.replaceOffer = null;

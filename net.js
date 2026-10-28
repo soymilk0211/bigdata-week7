@@ -1,4 +1,22 @@
 // 多人房間 / PeerJS P2P 連線層
+
+// ---- 5 碼房間代碼 ----------------------------------------------------------
+// 房主用「前綴 + 5 碼」向 PeerJS 配對伺服器登記，畫面上只顯示 5 碼（去掉容易看錯的 0/O/1/I）。
+// 改了房間訊息或對局格式時，把前綴的版本號往上加，新舊版本就進不了同一個房間。
+export const ROOM_PREFIX = 'econparty-v1-';
+const ROOM_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+export function makeRoomCode(random = Math.random) {
+  let code = '';
+  for (let i = 0; i < 5; i++) code += ROOM_ALPHABET[Math.floor(random() * ROOM_ALPHABET.length)];
+  return code;
+}
+// 使用者輸入的代碼：去掉空白和連字號、轉大寫；不是 5 碼時回傳空字串。
+export function normalizeRoomCode(input) {
+  const code = String(input ?? '').replace(/[\s-]/g, '').toUpperCase();
+  return code.length === 5 && [...code].every(c => ROOM_ALPHABET.includes(c)) ? code : '';
+}
+export const roomPeerId = code => ROOM_PREFIX + code;
+
 export const PartyNet = (() => {
   const rid = () => (globalThis.crypto?.randomUUID?.() || `p-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`);
   // 客機每 3 秒送一次 ping；房主 12 秒沒收到任何訊息就把該玩家標成「已離線」（手機鎖螢幕或直接關頁時 PeerJS 常常不會發出 close）。
@@ -57,14 +75,25 @@ export const PartyNet = (() => {
         confirms: [], createdAt: Date.now(),
         players: []
       };
-      const peer = new PeerConstructor();
+      this.openHostPeer(PeerConstructor, roleId, 0);
+      this.emitLobby();
+      this.status('正在建立 PeerJS 房間…');
+      return this.lobby;
+    }
+
+    // 用新的 5 碼登記；代碼剛好被別的房間用走（unavailable-id）就換一個再試。
+    openHostPeer(PeerConstructor, roleId, attempt) {
+      const code = makeRoomCode();
+      const peer = new PeerConstructor(roomPeerId(code));
       this._peer = peer;
+      let opened = false;
       peer.on('open', peerId => {
         if (!this.active || this._peer !== peer) return;
+        opened = true;
         this.peerId = peerId;
         this.hostId = peerId;
-        this.code = peerId;
-        this.lobby.code = peerId;
+        this.code = code;
+        this.lobby.code = code;
         this.lobby.hostId = peerId;
         this.lobby.players = [{ peerId, name: this.name, roleId, host: true, connected: true }];
         this.emitLobby();
@@ -73,20 +102,27 @@ export const PartyNet = (() => {
         this.status(`房間 ${this.code} 已建立，等待玩家加入。`);
       });
       peer.on('connection', conn => this.wireConnection(conn));
-      peer.on('error', error => this.error(error?.message || 'PeerJS 連線錯誤'));
-      this.emitLobby();
-      this.status('正在建立 PeerJS 房間…');
-      return this.lobby;
+      peer.on('error', error => {
+        if (this._peer !== peer) return;
+        if (error?.type === 'unavailable-id' && !opened && attempt < 5) {
+          try { peer.destroy(); } catch { }
+          this.openHostPeer(PeerConstructor, roleId, attempt + 1);
+          return;
+        }
+        this.error(error?.message || 'PeerJS 連線錯誤');
+      });
     }
 
     joinRoom(code, name) {
       this.leave(false);
-      this.code = String(code || '').trim();
-      if (!this.code || this.code.length > 128) throw Error('請輸入有效的 Peer ID。');
+      // 5 碼代碼轉成房主登記的 ID；不是 5 碼時當成完整的 Peer ID（舊的連結）。
+      const shortCode = normalizeRoomCode(code);
+      this.code = shortCode || String(code || '').trim();
+      if (!this.code || this.code.length > 128) throw Error('請輸入 5 碼房間代碼。');
       const PeerConstructor = globalThis.Peer;
       if (typeof PeerConstructor !== 'function') throw Error('PeerJS 尚未載入，請確認網路連線後重新整理。');
       this.host = false;
-      this.hostId = this.code;
+      this.hostId = shortCode ? roomPeerId(shortCode) : this.code;
       this.active = true;
       this.name = cleanName(name, '玩家');
       this.lobby = {
@@ -102,7 +138,18 @@ export const PartyNet = (() => {
         this.lobby.players[0].peerId = peerId;
         this.wireConnection(peer.connect(this.hostId));
       });
-      peer.on('error', error => this.error(error?.message || 'PeerJS 連線錯誤'));
+      peer.on('error', error => {
+        if (this._peer !== peer) return;
+        // 找不到房間：回到加入畫面（代碼和名字留著），不要停在空的大廳。
+        if (error?.type === 'peer-unavailable' && !this.peers.get(this.hostId)?.conn?.open) {
+          const code = this.code, name = this.name;
+          this.leave();
+          this.error('找不到這個房間：請確認 5 碼代碼，並請房主把遊戲頁面開在最前面（重新整理會換代碼）。');
+          this.onHostLost?.(code, name);
+          return;
+        }
+        this.error(error?.message || 'PeerJS 連線錯誤');
+      });
       this.emitLobby();
       this.status(`正在加入房間 ${this.code}…`);
       return this.lobby;
@@ -391,6 +438,7 @@ export const PartyNet = (() => {
       if (msg.t === 'lobby' && msg.lobby) {
         this.lobby = msg.lobby;
         if (msg.lobby.hostId) this.hostId = msg.lobby.hostId;
+        if (msg.lobby.code) this.code = msg.lobby.code;
         this.emitLobby();
         return;
       }

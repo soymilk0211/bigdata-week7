@@ -2054,6 +2054,12 @@ engineHooks.beforeEndTurn = (state, player) => {
   }
   // 未處理的起點買星／黑市滿包替換不得跨回合殘留，否則會鎖住下一位玩家。
   if (ext.starOffer?.playerId === player.id) ext.starOffer = null;
+  // 命運輪盤、內線交易、投資邀請和事件提示也一樣：殘留的話下一位玩家的二選一視窗永遠不會出現。
+  // 已付款的輪盤直接套用結果；沒回應的邀請視為放棄；事件效果早已套用，提示直接關掉。
+  if (ext.wheelPending?.playerId === player.id) extResolveWheel(state, { playerId: player.id, at: ext.wheelPending.at });
+  if (ext.insiderOffer?.playerId === player.id) ext.insiderOffer = null;
+  if (ext.investOffer?.playerId === player.id) ext.investOffer = null;
+  if (ext.eventPrompt?.playerId === player.id) ext.eventPrompt = null;
   if (ext.replaceOffer?.playerId === player.id) {
     const offer = ext.replaceOffer;
     ext.replaceOffer = null;
@@ -3329,6 +3335,24 @@ function isNewerGame(incoming,current){
 
 
 // 多人房間 / PeerJS P2P 連線層
+
+// ---- 5 碼房間代碼 ----------------------------------------------------------
+// 房主用「前綴 + 5 碼」向 PeerJS 配對伺服器登記，畫面上只顯示 5 碼（去掉容易看錯的 0/O/1/I）。
+// 改了房間訊息或對局格式時，把前綴的版本號往上加，新舊版本就進不了同一個房間。
+const ROOM_PREFIX = 'econparty-v1-';
+const ROOM_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+function makeRoomCode(random = Math.random) {
+  let code = '';
+  for (let i = 0; i < 5; i++) code += ROOM_ALPHABET[Math.floor(random() * ROOM_ALPHABET.length)];
+  return code;
+}
+// 使用者輸入的代碼：去掉空白和連字號、轉大寫；不是 5 碼時回傳空字串。
+function normalizeRoomCode(input) {
+  const code = String(input ?? '').replace(/[\s-]/g, '').toUpperCase();
+  return code.length === 5 && [...code].every(c => ROOM_ALPHABET.includes(c)) ? code : '';
+}
+const roomPeerId = code => ROOM_PREFIX + code;
+
 const PartyNet = (() => {
   const rid = () => (globalThis.crypto?.randomUUID?.() || `p-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`);
   // 客機每 3 秒送一次 ping；房主 12 秒沒收到任何訊息就把該玩家標成「已離線」（手機鎖螢幕或直接關頁時 PeerJS 常常不會發出 close）。
@@ -3387,14 +3411,25 @@ const PartyNet = (() => {
         confirms: [], createdAt: Date.now(),
         players: []
       };
-      const peer = new PeerConstructor();
+      this.openHostPeer(PeerConstructor, roleId, 0);
+      this.emitLobby();
+      this.status('正在建立 PeerJS 房間…');
+      return this.lobby;
+    }
+
+    // 用新的 5 碼登記；代碼剛好被別的房間用走（unavailable-id）就換一個再試。
+    openHostPeer(PeerConstructor, roleId, attempt) {
+      const code = makeRoomCode();
+      const peer = new PeerConstructor(roomPeerId(code));
       this._peer = peer;
+      let opened = false;
       peer.on('open', peerId => {
         if (!this.active || this._peer !== peer) return;
+        opened = true;
         this.peerId = peerId;
         this.hostId = peerId;
-        this.code = peerId;
-        this.lobby.code = peerId;
+        this.code = code;
+        this.lobby.code = code;
         this.lobby.hostId = peerId;
         this.lobby.players = [{ peerId, name: this.name, roleId, host: true, connected: true }];
         this.emitLobby();
@@ -3403,20 +3438,27 @@ const PartyNet = (() => {
         this.status(`房間 ${this.code} 已建立，等待玩家加入。`);
       });
       peer.on('connection', conn => this.wireConnection(conn));
-      peer.on('error', error => this.error(error?.message || 'PeerJS 連線錯誤'));
-      this.emitLobby();
-      this.status('正在建立 PeerJS 房間…');
-      return this.lobby;
+      peer.on('error', error => {
+        if (this._peer !== peer) return;
+        if (error?.type === 'unavailable-id' && !opened && attempt < 5) {
+          try { peer.destroy(); } catch { }
+          this.openHostPeer(PeerConstructor, roleId, attempt + 1);
+          return;
+        }
+        this.error(error?.message || 'PeerJS 連線錯誤');
+      });
     }
 
     joinRoom(code, name) {
       this.leave(false);
-      this.code = String(code || '').trim();
-      if (!this.code || this.code.length > 128) throw Error('請輸入有效的 Peer ID。');
+      // 5 碼代碼轉成房主登記的 ID；不是 5 碼時當成完整的 Peer ID（舊的連結）。
+      const shortCode = normalizeRoomCode(code);
+      this.code = shortCode || String(code || '').trim();
+      if (!this.code || this.code.length > 128) throw Error('請輸入 5 碼房間代碼。');
       const PeerConstructor = globalThis.Peer;
       if (typeof PeerConstructor !== 'function') throw Error('PeerJS 尚未載入，請確認網路連線後重新整理。');
       this.host = false;
-      this.hostId = this.code;
+      this.hostId = shortCode ? roomPeerId(shortCode) : this.code;
       this.active = true;
       this.name = cleanName(name, '玩家');
       this.lobby = {
@@ -3432,7 +3474,18 @@ const PartyNet = (() => {
         this.lobby.players[0].peerId = peerId;
         this.wireConnection(peer.connect(this.hostId));
       });
-      peer.on('error', error => this.error(error?.message || 'PeerJS 連線錯誤'));
+      peer.on('error', error => {
+        if (this._peer !== peer) return;
+        // 找不到房間：回到加入畫面（代碼和名字留著），不要停在空的大廳。
+        if (error?.type === 'peer-unavailable' && !this.peers.get(this.hostId)?.conn?.open) {
+          const code = this.code, name = this.name;
+          this.leave();
+          this.error('找不到這個房間：請確認 5 碼代碼，並請房主把遊戲頁面開在最前面（重新整理會換代碼）。');
+          this.onHostLost?.(code, name);
+          return;
+        }
+        this.error(error?.message || 'PeerJS 連線錯誤');
+      });
       this.emitLobby();
       this.status(`正在加入房間 ${this.code}…`);
       return this.lobby;
@@ -3721,6 +3774,7 @@ const PartyNet = (() => {
       if (msg.t === 'lobby' && msg.lobby) {
         this.lobby = msg.lobby;
         if (msg.lobby.hostId) this.hostId = msg.lobby.hostId;
+        if (msg.lobby.code) this.code = msg.lobby.code;
         this.emitLobby();
         return;
       }
@@ -4291,16 +4345,16 @@ const PartyUI = (() => {
     if (!el) return;
     const roles = window.__partyData?.LOBBY_ROLES || [];
     const selfName = presetName || document.querySelector('[data-setup-name="0"]')?.value || '玩家 1';
-    const joinCopy = presetCode ? '已帶入房間代碼，輸入你的名稱後按「加入房間」。' : '向房主取得 6 碼房間代碼，加入後在大廳選擇企業。';
+    const joinCopy = presetCode ? '已帶入房間代碼，輸入你的名稱後按「加入房間」。' : '向房主取得 5 碼房間代碼，加入後在大廳選擇企業。';
     el.innerHTML = `
       <div class="ext-modal-backdrop"></div>
       <div class="connect-card">
         <button class="ext-modal-close" data-connect-close type="button">×</button>
         <p class="ext-kicker">${kind === 'create' ? 'CREATE ROOM' : 'JOIN ROOM'}</p>
         <h2>${kind === 'create' ? '建立連線房間' : presetCode ? '加入房間' : '輸入房間代碼'}</h2>
-        <p>${kind === 'create' ? '產生 6 碼房間代碼，邀請 2–8 位玩家加入同一個大廳。' : joinCopy}</p>
+        <p>${kind === 'create' ? '產生 5 碼房間代碼，邀請 2–8 位玩家加入同一個大廳。' : joinCopy}</p>
         <label>你的名稱<input id="connect-name" maxlength="16" value="${h(selfName)}"></label>
-        ${kind === 'create' ? `<label>你的企業<select id="connect-role">${roles.map(r => `<option value="${r.id}">${r.icon} ${h(r.name)}</option>`).join('')}</select></label>` : `<label>房間代碼<input id="connect-code" maxlength="128" placeholder="輸入 Peer ID" value="${h(presetCode)}"></label>`}
+        ${kind === 'create' ? `<label>你的企業<select id="connect-role">${roles.map(r => `<option value="${r.id}">${r.icon} ${h(r.name)}</option>`).join('')}</select></label>` : `<label>房間代碼<input id="connect-code" maxlength="128" placeholder="例如 K7M2Q" autocapitalize="characters" autocomplete="off" value="${h(presetCode)}"></label>`}
         <p class="connect-status" id="connect-status"></p>
         <div class="connect-actions">
           <button class="secondary" data-connect-close type="button">取消</button>
@@ -5306,14 +5360,20 @@ const PartyUI = (() => {
     // 先關閉視窗，再正式套用效果與播放對應動畫，避免動畫疊在提示視窗上。
     el.hidden = true;
     wheelOpen = false;
-    Promise.resolve(app()?.run?.(() => {
+    // 用 runAction：多人房間裡客機的確認要送給房主執行（以前用 run，客機按了房主收不到，輪盤一直卡著）。
+    Promise.resolve(app()?.runAction?.({ type: 'RESOLVE_WHEEL', at: data.at, playerId: data.playerId }, () => {
       const result = window.__partyEngine?.extResolveWheel?.(state(), { playerId: data.playerId, at: data.at });
       if (result) app()?.notify?.(`🌈 ${result.effect?.name || '命運輪盤'}：${result.text || ''}`);
       else { lastWheelKey = ''; app()?.notify?.('輪盤結果已失效。'); }
-    })).finally(() => {
+    }, { authoritative: true })).finally(() => {
       wheelResolving = false;
       afterSpecialChange();
     });
+    // 確認沒有生效（房主正在播動畫、連線掉封包）時，幾秒後再把輪盤叫出來，讓玩家重按一次。
+    setTimeout(() => {
+      const pending = state()?.ext?.wheelPending;
+      if (pending && String(pending.at) === String(data.at) && !wheelOpen) { lastWheelKey = ''; showWheel(pending); }
+    }, 2500);
   }
 
   // -------------------------------------------------------------------------
@@ -6704,7 +6764,8 @@ PartyNet.onAction = (action,fromPeer) => {
     AUCTION_ACTION:window.__partyEngine?.extAuctionCurrent?.(state)?.id,
     INVEST:state.ext?.investOffer?.playerId,
     TAX:state.ext?.taxChoice?.playerId,
-    INSIDER:state.ext?.insiderOffer?.playerId
+    INSIDER:state.ext?.insiderOffer?.playerId,
+    RESOLVE_WHEEL:state.ext?.wheelPending?.playerId
   };
   const actorId=pendingOwners[action.type]||activePlayer()?.id;
   if(action.playerId!==actorId||state.net.owners?.[actorId]!==fromPeer)return;
@@ -6756,6 +6817,8 @@ PartyNet.onAction = (action,fromPeer) => {
       execute(()=>action.action==='pay'?extTaxPay(state):extTaxDetain(state));return;
     case 'INSIDER':
       execute(()=>action.yes?extInsiderPay(state):state.ext.insiderOffer=null);return;
+    case 'RESOLVE_WHEEL':
+      execute(()=>extResolveWheel(state,{playerId:actorId,at:action.at}));return;
     case 'TRUTH_GATE':
       execute(()=>extUseMythic(state,'truthGate',action.payload));return;
     case 'DEBUG_GIVE':

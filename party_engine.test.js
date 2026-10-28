@@ -780,3 +780,36 @@ test('幽靈干擾動畫、鎖銬音效與測試模式幽靈點選已接線', as
   assert.match(css, /animation:\s*vector-lock-ring/);
   assert.match(css, /body\.debug-mode \.ghost-piece\s*\{[\s\S]*?pointer-events:\s*auto/);
 });
+
+test('結束回合時沒確認的命運輪盤直接套用、沒回應的特殊格邀請視為放棄，不會卡住下一位玩家', () => {
+  const state = make('star', 7, {debug: false});
+  avoidGhost(state);
+  const [p1, p2] = state.players;
+  state.phase = 'resolve';
+  const prepared = extPrepareWheel(state, p1);
+  state.ext.insiderOffer = {playerId: p1.id, tileIndex: 3};
+  state.ext.investOffer = {playerId: p1.id, tileIndex: 5, cost: 0};
+  state.ext.eventPrompt = {playerId: p1.id, eventId: 'test', at: 1};
+  endTurn(state);
+  assert.equal(state.ext.wheelPending, null);
+  assert.equal(state.ext.wheelResult?.effect?.id, prepared.effect.id);
+  assert.equal(state.ext.wheelResult?.playerId, p1.id);
+  assert.equal(state.ext.insiderOffer, null);
+  assert.equal(state.ext.investOffer, null);
+  assert.equal(state.ext.eventPrompt, null);
+  assert.equal(state.players[state.turnIndex].id, p2.id);
+});
+
+test('結束回合只清掉自己的邀請，別人的輪盤和事件提示不受影響', () => {
+  const state = make('star', 8, {debug: false});
+  avoidGhost(state);
+  const [p1, p2] = state.players;
+  state.phase = 'resolve';
+  extPrepareWheel(state, p2);
+  state.ext.eventPrompt = {playerId: p2.id, eventId: 'test', at: 1};
+  endTurn(state);
+  assert.equal(state.ext.wheelPending?.playerId, p2.id);
+  assert.equal(state.ext.eventPrompt?.playerId, p2.id);
+  assert.equal(state.players[state.turnIndex].id, p2.id);
+  assert.notEqual(p1.id, p2.id);
+});

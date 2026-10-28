@@ -779,7 +779,8 @@ PartyNet.onAction = (action,fromPeer) => {
     AUCTION_ACTION:window.__partyEngine?.extAuctionCurrent?.(state)?.id,
     INVEST:state.ext?.investOffer?.playerId,
     TAX:state.ext?.taxChoice?.playerId,
-    INSIDER:state.ext?.insiderOffer?.playerId
+    INSIDER:state.ext?.insiderOffer?.playerId,
+    RESOLVE_WHEEL:state.ext?.wheelPending?.playerId
   };
   const actorId=pendingOwners[action.type]||activePlayer()?.id;
   if(action.playerId!==actorId||state.net.owners?.[actorId]!==fromPeer)return;
@@ -831,6 +832,8 @@ PartyNet.onAction = (action,fromPeer) => {
       execute(()=>action.action==='pay'?extTaxPay(state):extTaxDetain(state));return;
     case 'INSIDER':
       execute(()=>action.yes?extInsiderPay(state):state.ext.insiderOffer=null);return;
+    case 'RESOLVE_WHEEL':
+      execute(()=>extResolveWheel(state,{playerId:actorId,at:action.at}));return;
     case 'TRUTH_GATE':
       execute(()=>extUseMythic(state,'truthGate',action.payload));return;
     case 'DEBUG_GIVE':

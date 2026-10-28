@@ -232,16 +232,16 @@ export const PartyUI = (() => {
     if (!el) return;
     const roles = window.__partyData?.LOBBY_ROLES || [];
     const selfName = presetName || document.querySelector('[data-setup-name="0"]')?.value || '玩家 1';
-    const joinCopy = presetCode ? '已帶入房間代碼，輸入你的名稱後按「加入房間」。' : '向房主取得 6 碼房間代碼，加入後在大廳選擇企業。';
+    const joinCopy = presetCode ? '已帶入房間代碼，輸入你的名稱後按「加入房間」。' : '向房主取得 5 碼房間代碼，加入後在大廳選擇企業。';
     el.innerHTML = `
       <div class="ext-modal-backdrop"></div>
       <div class="connect-card">
         <button class="ext-modal-close" data-connect-close type="button">×</button>
         <p class="ext-kicker">${kind === 'create' ? 'CREATE ROOM' : 'JOIN ROOM'}</p>
         <h2>${kind === 'create' ? '建立連線房間' : presetCode ? '加入房間' : '輸入房間代碼'}</h2>
-        <p>${kind === 'create' ? '產生 6 碼房間代碼，邀請 2–8 位玩家加入同一個大廳。' : joinCopy}</p>
+        <p>${kind === 'create' ? '產生 5 碼房間代碼，邀請 2–8 位玩家加入同一個大廳。' : joinCopy}</p>
         <label>你的名稱<input id="connect-name" maxlength="16" value="${h(selfName)}"></label>
-        ${kind === 'create' ? `<label>你的企業<select id="connect-role">${roles.map(r => `<option value="${r.id}">${r.icon} ${h(r.name)}</option>`).join('')}</select></label>` : `<label>房間代碼<input id="connect-code" maxlength="128" placeholder="輸入 Peer ID" value="${h(presetCode)}"></label>`}
+        ${kind === 'create' ? `<label>你的企業<select id="connect-role">${roles.map(r => `<option value="${r.id}">${r.icon} ${h(r.name)}</option>`).join('')}</select></label>` : `<label>房間代碼<input id="connect-code" maxlength="128" placeholder="例如 K7M2Q" autocapitalize="characters" autocomplete="off" value="${h(presetCode)}"></label>`}
         <p class="connect-status" id="connect-status"></p>
         <div class="connect-actions">
           <button class="secondary" data-connect-close type="button">取消</button>
@@ -1247,14 +1247,20 @@ export const PartyUI = (() => {
     // 先關閉視窗，再正式套用效果與播放對應動畫，避免動畫疊在提示視窗上。
     el.hidden = true;
     wheelOpen = false;
-    Promise.resolve(app()?.run?.(() => {
+    // 用 runAction：多人房間裡客機的確認要送給房主執行（以前用 run，客機按了房主收不到，輪盤一直卡著）。
+    Promise.resolve(app()?.runAction?.({ type: 'RESOLVE_WHEEL', at: data.at, playerId: data.playerId }, () => {
       const result = window.__partyEngine?.extResolveWheel?.(state(), { playerId: data.playerId, at: data.at });
       if (result) app()?.notify?.(`🌈 ${result.effect?.name || '命運輪盤'}：${result.text || ''}`);
       else { lastWheelKey = ''; app()?.notify?.('輪盤結果已失效。'); }
-    })).finally(() => {
+    }, { authoritative: true })).finally(() => {
       wheelResolving = false;
       afterSpecialChange();
     });
+    // 確認沒有生效（房主正在播動畫、連線掉封包）時，幾秒後再把輪盤叫出來，讓玩家重按一次。
+    setTimeout(() => {
+      const pending = state()?.ext?.wheelPending;
+      if (pending && String(pending.at) === String(data.at) && !wheelOpen) { lastWheelKey = ''; showWheel(pending); }
+    }, 2500);
   }
 
   // -------------------------------------------------------------------------

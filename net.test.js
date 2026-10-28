@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {PartyNet, roomInviteLink, roomCodeFromLink} from './net.js';
+import {PartyNet, roomInviteLink, roomCodeFromLink, makeRoomCode, normalizeRoomCode, roomPeerId, ROOM_PREFIX} from './net.js';
 
 class FakeConnection {
   constructor(peer) { this.peer = peer; this.handlers = new Map(); this.sent = []; this.open = false; }
@@ -11,7 +11,7 @@ class FakeConnection {
 }
 
 class FakePeer {
-  constructor() { this.handlers = new Map(); FakePeer.last = this; }
+  constructor(id) { this.id = id; this.handlers = new Map(); FakePeer.last = this; }
   on(event, handler) { this.handlers.set(event, handler); }
   emit(event, value) { this.handlers.get(event)?.(value); }
   connect(peerId) { this.connectTarget = peerId; this.connection = new FakeConnection(peerId); return this.connection; }
@@ -26,7 +26,8 @@ test('多人房間可設定保護費抬升價，並帶入開局設定', () => {
   try {
     PartyNet.createRoom({name: '房主'});
     FakePeer.last.emit('open', 'host-peer-id');
-    assert.equal(PartyNet.code, 'host-peer-id');
+    assert.match(PartyNet.code, /^[A-HJ-NP-Z2-9]{5}$/);
+    assert.equal(PartyNet.hostId, 'host-peer-id');
     assert.equal(PartyNet.lobby.doomStep, 500);
     PartyNet.addPlayer('peer-test', '玩家');
     PartyNet.setMode('evil');
@@ -373,4 +374,65 @@ test('房主關閉房間或拒絕加入時，客機離開房間並看到原因',
     assert.equal(PartyNet.active, false);
     assert.deepEqual(errors, ['對局已開始，暫時無法加入。']);
   });
+});
+
+test('5 碼房間代碼：不含 0／O／1／I，輸入時不分大小寫、可以有空白', () => {
+  for (let i = 0; i < 200; i++) assert.match(makeRoomCode(), /^[A-HJ-NP-Z2-9]{5}$/);
+  assert.equal(makeRoomCode(() => 0), 'AAAAA');
+  assert.equal(normalizeRoomCode(' k7m-2q '), 'K7M2Q');
+  assert.equal(normalizeRoomCode('K7M2'), '');
+  assert.equal(normalizeRoomCode('K0M2Q'), '');
+  assert.equal(normalizeRoomCode('3f2a9c1e-7b4d-4e8a-9c2f-1a2b3c4d5e6f'), '');
+  assert.equal(roomPeerId('K7M2Q'), `${ROOM_PREFIX}K7M2Q`);
+});
+
+test('房主用「前綴 + 5 碼」登記，畫面只顯示 5 碼；代碼被用走時自動換一個', () => {
+  const previousPeer = globalThis.Peer;
+  globalThis.Peer = FakePeer;
+  try {
+    PartyNet.createRoom({name: '房主'});
+    const first = FakePeer.last;
+    assert.ok(first.id.startsWith(ROOM_PREFIX));
+    first.emit('error', {type: 'unavailable-id', message: 'ID is taken'});
+    const second = FakePeer.last;
+    assert.notEqual(second, first);
+    assert.ok(second.id.startsWith(ROOM_PREFIX));
+    second.emit('open', second.id);
+    const code = second.id.slice(ROOM_PREFIX.length);
+    assert.match(code, /^[A-HJ-NP-Z2-9]{5}$/);
+    assert.equal(PartyNet.code, code);
+    assert.equal(PartyNet.lobby.code, code);
+    assert.equal(PartyNet.hostId, second.id);
+  } finally {
+    PartyNet.leave(false);
+    if (previousPeer === undefined) delete globalThis.Peer;
+    else globalThis.Peer = previousPeer;
+  }
+});
+
+test('客機輸入 5 碼（大小寫都可以）就連到房主；找不到房間時回到加入畫面', () => {
+  const previousPeer = globalThis.Peer;
+  globalThis.Peer = FakePeer;
+  const errors = [];
+  let lost = null;
+  PartyNet.onError = text => errors.push(text);
+  PartyNet.onHostLost = (code, name) => { lost = `${code}/${name}`; };
+  try {
+    PartyNet.joinRoom(' k7m2q ', '小明');
+    assert.equal(PartyNet.code, 'K7M2Q');
+    const guestPeer = FakePeer.last;
+    guestPeer.emit('open', 'guest-a');
+    assert.equal(guestPeer.connectTarget, `${ROOM_PREFIX}K7M2Q`);
+    guestPeer.emit('error', {type: 'peer-unavailable', message: 'Could not connect'});
+    assert.equal(PartyNet.active, false);
+    assert.equal(lost, 'K7M2Q/小明');
+    assert.match(errors[0], /找不到這個房間/);
+    assert.throws(() => PartyNet.joinRoom('  ', '小明'), /5 碼房間代碼/);
+  } finally {
+    PartyNet.leave(false);
+    PartyNet.onError = null;
+    PartyNet.onHostLost = null;
+    if (previousPeer === undefined) delete globalThis.Peer;
+    else globalThis.Peer = previousPeer;
+  }
 });
