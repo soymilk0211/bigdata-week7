@@ -3719,6 +3719,25 @@ const PartyNet = (() => {
   return new Net();
 })();
 
+// ---- 邀請連結（大廳 QR Code 的內容） ------------------------------------
+// 目前網址加上 ?room=代碼；file:// 或 localhost 的網址別的裝置打不開，回傳空字串。
+function roomInviteLink(href, code) {
+  const roomCode = String(code || '').trim();
+  if (!roomCode) return '';
+  let url;
+  try { url = new URL(href); } catch { return ''; }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') return '';
+  if (/^(localhost|127(\.\d+){3}|\[::1\])$/i.test(url.hostname)) return '';
+  url.hash = '';
+  url.searchParams.set('room', roomCode);
+  return url.href;
+}
+
+// 從網址讀出 ?room=代碼，沒有時回傳空字串。
+function roomCodeFromLink(href) {
+  try { return (new URL(href).searchParams.get('room') || '').trim(); } catch { return ''; }
+}
+
 globalThis.PartyNet = PartyNet;
 
 
@@ -3912,6 +3931,7 @@ globalThis.SoundManager = SoundManager;
 // ============================================================================
 // 派對擴充 UI（動態掛載，不破壞原始 index.html 結構）
 // ============================================================================
+
 const PartyUI = (() => {
   const $ = s => document.querySelector(s);
   const $$ = s => Array.from(document.querySelectorAll(s));
@@ -3955,6 +3975,19 @@ const PartyUI = (() => {
   }
   function playerName(p, id) {
     return p?.players?.find(x => x.id === id)?.name || '';
+  }
+  // 房間 QR Code：qrcode-generator 由 index.html 從 unpkg 載入；沒載到時大廳只顯示代碼。
+  let qrCache = { text: '', svg: '' };
+  function qrSvg(text) {
+    if (!text || typeof globalThis.qrcode !== 'function') return '';
+    if (qrCache.text === text) return qrCache.svg;
+    try {
+      const qr = globalThis.qrcode(0, 'M');
+      qr.addData(text);
+      qr.make();
+      qrCache = { text, svg: qr.createSvgTag({ cellSize: 4, margin: 16, scalable: true }) };
+      return qrCache.svg;
+    } catch { return ''; }
   }
 
   let modal = null;
@@ -4123,20 +4156,21 @@ const PartyUI = (() => {
     }
   }
 
-  function openConnect(kind) {
+  function openConnect(kind, presetCode = '') {
     const el = $('#party-connect');
     if (!el) return;
     const roles = window.__partyData?.LOBBY_ROLES || [];
     const selfName = document.querySelector('[data-setup-name="0"]')?.value || '玩家 1';
+    const joinCopy = presetCode ? '已從 QR Code 帶入房間代碼，輸入你的名稱後按「加入房間」。' : '向房主取得 6 碼房間代碼，加入後在大廳選擇企業。';
     el.innerHTML = `
       <div class="ext-modal-backdrop"></div>
       <div class="connect-card">
         <button class="ext-modal-close" data-connect-close type="button">×</button>
         <p class="ext-kicker">${kind === 'create' ? 'CREATE ROOM' : 'JOIN ROOM'}</p>
-        <h2>${kind === 'create' ? '建立連線房間' : '輸入房間代碼'}</h2>
-        <p>${kind === 'create' ? '產生 6 碼房間代碼，邀請 2–8 位玩家加入同一個大廳。' : '向房主取得 6 碼房間代碼，加入後在大廳選擇企業。'}</p>
+        <h2>${kind === 'create' ? '建立連線房間' : presetCode ? '加入房間' : '輸入房間代碼'}</h2>
+        <p>${kind === 'create' ? '產生 6 碼房間代碼，邀請 2–8 位玩家加入同一個大廳。' : joinCopy}</p>
         <label>你的名稱<input id="connect-name" maxlength="16" value="${h(selfName)}"></label>
-        ${kind === 'create' ? `<label>你的企業<select id="connect-role">${roles.map(r => `<option value="${r.id}">${r.icon} ${h(r.name)}</option>`).join('')}</select></label>` : `<label>房間代碼<input id="connect-code" maxlength="128" placeholder="輸入 Peer ID"></label>`}
+        ${kind === 'create' ? `<label>你的企業<select id="connect-role">${roles.map(r => `<option value="${r.id}">${r.icon} ${h(r.name)}</option>`).join('')}</select></label>` : `<label>房間代碼<input id="connect-code" maxlength="128" placeholder="輸入 Peer ID" value="${h(presetCode)}"></label>`}
         <p class="connect-status" id="connect-status"></p>
         <div class="connect-actions">
           <button class="secondary" data-connect-close type="button">取消</button>
@@ -4187,11 +4221,16 @@ const PartyUI = (() => {
       const visible = allowed.includes(key);
       return `<label data-lobby-field="${key}" class="${visible ? '' : 'hidden'}">${label}<input id="${id}" type="number" ${extra} value="${value}" ${isHost && visible ? '' : 'disabled'}></label>`;
     };
+    const invite = roomInviteLink(location.href, lobby.code);
+    const qr = qrSvg(invite);
+    const qrBlock = qr
+      ? `<div class="lobby-qr"><div class="lobby-qr-code" id="lobby-qr" role="img" aria-label="加入房間的 QR Code">${qr}</div><small>其他人用手機相機掃描，會打開遊戲並自動帶入房間代碼。</small></div>`
+      : lobby.code && !invite ? '<p class="lobby-qr-note">用線上網址開啟遊戲才會顯示 QR Code（本機網址別的裝置打不開）。</p>' : '';
     el.innerHTML = `
       <div class="ext-modal-backdrop"></div>
       <div class="lobby-card">
         <div class="lobby-top">
-          <div><p class="ext-kicker">MULTIPLAYER LOBBY · WebRTC</p><h2>派對大廳</h2><p class="lobby-code-line">房間代碼 <strong id="lobby-code">${h(lobby.code)}</strong><button class="quiet" id="copy-code" type="button">複製</button></p></div>
+          <div><p class="ext-kicker">MULTIPLAYER LOBBY · WebRTC</p><h2>派對大廳</h2><p class="lobby-code-line">房間代碼 <strong id="lobby-code">${h(lobby.code)}</strong><button class="quiet" id="copy-code" type="button">複製</button></p>${qrBlock}</div>
           <button class="ext-modal-close" id="lobby-leave" type="button" title="離開">×</button>
         </div>
         <div class="lobby-grid">
@@ -5735,6 +5774,12 @@ const PartyUI = (() => {
     ensureRoot();
     bindEvents();
     renderSetupExtras();
+    // 掃 QR Code 進來的網址帶有 ?room=代碼：直接打開加入視窗並填好代碼，再把網址清乾淨。
+    const invited = roomCodeFromLink(location.href);
+    if (invited && !window.PartyNet?.active) {
+      openConnect('join', invited);
+      try { const url = new URL(location.href); url.searchParams.delete('room'); history.replaceState(history.state, '', url.href); } catch { }
+    }
     // 將模式資料提供給動態 UI
     window.__partyData = window.__partyData || {
       GAME_MODES: {

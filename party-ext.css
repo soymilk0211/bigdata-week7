@@ -259,6 +259,11 @@
   font-family: ui-monospace, 'Cascadia Code', monospace;
 }
 .lobby-code-line .quiet { padding: 3px 7px; font-size: 10px; }
+.lobby-qr { display: flex; align-items: center; gap: 12px; margin-top: 10px; }
+.lobby-qr-code { flex: none; width: 148px; height: 148px; border: 1px solid #e3e8e4; border-radius: 10px; overflow: hidden; background: #fff; }
+.lobby-qr-code svg { display: block; width: 100%; height: 100%; }
+.lobby-qr small { font-size: 11.5px; line-height: 1.5; color: #7d8c88; max-width: 220px; }
+.lobby-qr-note { font-size: 11px; color: #7d8c88; margin: 6px 0 0; }
 .lobby-grid {
   display: grid;
   grid-template-columns: minmax(0, 1.15fr) minmax(260px, .85fr);

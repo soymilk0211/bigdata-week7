@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {PartyNet} from './net.js';
+import {PartyNet, roomInviteLink, roomCodeFromLink} from './net.js';
 
 class FakeConnection {
   constructor(peer) { this.peer = peer; this.handlers = new Map(); this.sent = []; this.open = false; }
@@ -130,4 +130,23 @@ test('重複收到相同封包時只處理一次', () => {
     if (previousPeer === undefined) delete globalThis.Peer;
     else globalThis.Peer = previousPeer;
   }
+});
+
+test('大廳 QR Code 的邀請連結：線上網址加上 ?room=，本機網址不產生', () => {
+  const code = '3f2a9c1e-7b4d-4e8a-9c2f-1a2b3c4d5e6f';
+  assert.equal(roomInviteLink('https://soymilk0211.github.io/bigdata-week7/', code), `https://soymilk0211.github.io/bigdata-week7/?room=${code}`);
+  assert.equal(roomInviteLink('https://soymilk0211.github.io/bigdata-week7/index.html?room=OLD#rules', ` ${code} `), `https://soymilk0211.github.io/bigdata-week7/index.html?room=${code}`);
+  assert.equal(roomInviteLink('http://192.168.1.20:4173/', 'abc'), 'http://192.168.1.20:4173/?room=abc');
+  assert.equal(roomInviteLink('https://soymilk0211.github.io/bigdata-week7/', ''), '');
+  for (const href of ['file:///C:/game/index.html', 'http://127.0.0.1:4173/', 'http://localhost:4173/', 'http://[::1]:4173/', 'not a url']) {
+    assert.equal(roomInviteLink(href, code), '', href);
+  }
+});
+
+test('掃 QR Code 打開的網址可以讀回房間代碼', () => {
+  const code = '3f2a9c1e-7b4d-4e8a-9c2f-1a2b3c4d5e6f';
+  assert.equal(roomCodeFromLink(roomInviteLink('https://soymilk0211.github.io/bigdata-week7/', code)), code);
+  assert.equal(roomCodeFromLink('https://soymilk0211.github.io/bigdata-week7/'), '');
+  assert.equal(roomCodeFromLink('https://soymilk0211.github.io/bigdata-week7/?room=%20abc%20'), 'abc');
+  assert.equal(roomCodeFromLink('not a url'), '');
 });

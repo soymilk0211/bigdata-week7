@@ -389,4 +389,23 @@ export const PartyNet = (() => {
   return new Net();
 })();
 
+// ---- 邀請連結（大廳 QR Code 的內容） ------------------------------------
+// 目前網址加上 ?room=代碼；file:// 或 localhost 的網址別的裝置打不開，回傳空字串。
+export function roomInviteLink(href, code) {
+  const roomCode = String(code || '').trim();
+  if (!roomCode) return '';
+  let url;
+  try { url = new URL(href); } catch { return ''; }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') return '';
+  if (/^(localhost|127(\.\d+){3}|\[::1\])$/i.test(url.hostname)) return '';
+  url.hash = '';
+  url.searchParams.set('room', roomCode);
+  return url.href;
+}
+
+// 從網址讀出 ?room=代碼，沒有時回傳空字串。
+export function roomCodeFromLink(href) {
+  try { return (new URL(href).searchParams.get('room') || '').trim(); } catch { return ''; }
+}
+
 globalThis.PartyNet = PartyNet;
