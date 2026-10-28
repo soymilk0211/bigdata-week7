@@ -436,3 +436,37 @@ test('客機輸入 5 碼（大小寫都可以）就連到房主；找不到房�
     else globalThis.Peer = previousPeer;
   }
 });
+
+test('企業不能重複：別人選走的企業會被房主拒絕，未定新創集團可以多人選', () => {
+  withHost(({join, errors}) => {
+    const a = join('guest-a', '小明');
+    const b = join('guest-b', '阿華');
+    a.emit('data', {t: 'role', roleId: 'bank'});
+    assert.equal(PartyNet.lobby.players[1].roleId, 'bank');
+    b.emit('data', {t: 'role', roleId: 'bank'});
+    assert.equal(PartyNet.lobby.players[2].roleId, 'random');
+    const sentToB = b.sent.slice(-2);
+    assert.equal(sentToB[0].t, 'error');
+    assert.match(sentToB[0].text, /已經被「小明」選走/);
+    assert.equal(sentToB[1].t, 'lobby');
+    assert.throws(() => PartyNet.selectRole('bank'), /已經被「小明」選走/);
+    assert.equal(PartyNet.assignRole('guest-b', 'bank'), '這家企業已經被「小明」選走了，請選別家。');
+    PartyNet.selectRole('random');
+    b.emit('data', {t: 'role', roleId: 'random'});
+    assert.deepEqual(PartyNet.lobby.players.map(p => p.roleId), ['random', 'bank', 'random']);
+    a.emit('data', {t: 'role', roleId: 'cloud'});
+    b.emit('data', {t: 'role', roleId: 'bank'});
+    assert.deepEqual(PartyNet.lobby.players.map(p => p.roleId), ['random', 'cloud', 'bank']);
+    assert.deepEqual(errors, []);
+  });
+});
+
+test('對局開始後不能換企業', () => {
+  withHost(({join}) => {
+    const a = join('guest-a', '小明');
+    PartyNet.startGame();
+    a.emit('data', {t: 'role', roleId: 'bank'});
+    assert.equal(PartyNet.lobby.players[1].roleId, 'random');
+    assert.match(a.sent.findLast(m => m.t === 'error').text, /對局已開始/);
+  });
+});

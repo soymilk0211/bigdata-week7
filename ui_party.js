@@ -293,6 +293,19 @@ export const PartyUI = (() => {
       return `<label data-lobby-field="${key}" class="${visible ? '' : 'hidden'}">${label}<input id="${id}" type="number" ${extra} value="${value}" ${isHost && visible ? '' : 'disabled'}></label>`;
     };
     const online = lobby.players.filter(p => p.host || p.connected !== false);
+    const me = lobby.players.find(p => p.peerId === net?.peerId);
+    const takenBy = (roleId, peerId) => roleId !== 'random' && lobby.players.find(p => p.peerId !== peerId && p.roleId === roleId);
+    // 選企業用按鈕：別人選走的變灰並寫出是誰，加進來的人一眼就知道哪些不能選。
+    const rolePicker = me && lobby.status === 'waiting' ? `
+      <div class="lobby-role-pick">
+        <div class="lobby-section-head"><span>選擇你的企業</span><small>灰色＝已被別人選走</small></div>
+        <div class="lobby-role-grid">${roles.map(r => {
+          const taker = takenBy(r.id, me.peerId);
+          const mine = me.roleId === r.id;
+          const note = taker ? `${h(shorten(taker.name, 6))} 已選` : mine ? '✓ 你選的' : r.id === 'random' ? '開局時隨機分配' : h(r.sector || '');
+          return `<button type="button" class="lobby-role-btn ${mine ? 'mine' : ''} ${taker ? 'taken' : ''}" data-pick-role="${r.id}" aria-pressed="${mine}" ${taker ? 'disabled' : ''} title="${h(r.name)}"><span>${r.icon}</span><div><strong>${h(r.name)}</strong><small>${note}</small></div></button>`;
+        }).join('')}</div>
+      </div>` : '';
     const offline = lobby.players.filter(p => !p.host && p.connected === false).map(p => `「${h(p.name)}」`).join('、');
     const hostStatus = online.length < 2 ? '等待至少 1 位玩家加入…'
       : offline ? `可以開始；${offline}已離線，開始時不會加入對局。` : '全員到齊，可以開始！';
@@ -317,9 +330,10 @@ export const PartyUI = (() => {
               return `<div class="lobby-player ${p.host ? 'host' : ''} ${isMe ? 'me' : ''} ${p.connected === false ? 'offline' : ''}">
                 <span class="lobby-avatar">${role?.icon || '🎲'}</span>
                 <div class="lobby-player-main"><strong>${h(p.name)}${p.host ? ' 👑' : ''}${isMe ? '（你）' : ''}</strong><small>${h(role?.name || '未定新創集團')}${p.connected === false ? ' · 已離線' : ' · 已連線'}</small></div>
-                ${(isMe || isHost) ? `<select data-lobby-role="${i}" class="lobby-role-select" ${isMe || isHost ? '' : 'disabled'}>${roles.map(r => `<option value="${r.id}" ${r.id === p.roleId ? 'selected' : ''}>${r.icon} ${h(r.name)}</option>`).join('')}</select>` : `<span class="lobby-role">${h(role?.name || '')}</span>`}
+                ${(isHost && !isMe) ? `<select data-lobby-role="${i}" class="lobby-role-select">${roles.map(r => { const taker = takenBy(r.id, p.peerId); return `<option value="${r.id}" ${r.id === p.roleId ? 'selected' : ''} ${taker ? 'disabled' : ''}>${r.icon} ${h(r.name)}${taker ? `（${h(shorten(taker.name, 6))}）` : ''}</option>`; }).join('')}</select>` : `<span class="lobby-role">${role?.icon || ''} ${h(role?.name || '')}</span>`}
               </div>`;
             }).join('')}
+            ${rolePicker}
           </div>
           <div class="lobby-settings">
             <div class="lobby-section-head"><span>對局設定</span><small>${isHost ? '房主可調整' : '由房主設定'}</small></div>
@@ -371,12 +385,17 @@ export const PartyUI = (() => {
     bind('#lobby-doom-price', v => window.PartyNet.setDoomPrice(v));
     bind('#lobby-doom-step', v => window.PartyNet.setDoomStep(v));
     $('#lobby-debug').onchange = e => window.PartyNet.setDebug(e.target.checked);
+    const roleError = message => { const status = $('#lobby-status'); if (status) status.textContent = message; app()?.notify?.(message); sound('error'); };
+    $$('[data-pick-role]').forEach(btn => btn.onclick = () => {
+      if (btn.classList.contains('mine')) return;
+      try { window.PartyNet.selectRole(btn.dataset.pickRole); sound('click'); } catch (e) { roleError(e.message); }
+    });
+    // 房主替別人換企業（例如兩個人搶同一家時）：一樣不能選已被選走的。
     $$('[data-lobby-role]').forEach(sel => sel.onchange = e => {
-      const idx = Number(sel.dataset.lobbyRole);
-      const p = lobby.players[idx];
-      if (!p) return;
-      if (isHost && p.peerId !== window.PartyNet.peerId) { p.roleId = e.target.value; window.PartyNet.broadcastLobby(); }
-      else window.PartyNet.selectRole(e.target.value);
+      const p = lobby.players[Number(sel.dataset.lobbyRole)];
+      if (!p || !isHost) return;
+      const error = window.PartyNet.assignRole(p.peerId, e.target.value);
+      if (error) { roleError(error); showLobby(window.PartyNet.lobby); }
     });
     const start = $('#lobby-start');
     if (start) start.onclick = () => {

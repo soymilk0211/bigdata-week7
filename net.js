@@ -325,11 +325,24 @@ export const PartyNet = (() => {
     selectRole(roleId) {
       if (!this.active) return;
       if (this.host) {
-        const p = this.myPlayer; if (p) { p.roleId = roleId; }
-        this.broadcastLobby();
+        const error = this.assignRole(this.peerId, roleId);
+        if (error) throw Error(error);
       } else if (this.hostId) {
         this.sendData({ t: 'role', roleId }, this.hostId);
       }
+    }
+
+    // 房主分配企業：同一家只能一個人選（未定新創集團可以多人）。回傳錯誤訊息，成功時回傳 null。
+    assignRole(peerId, roleId) {
+      if (!this.host || !this.lobby) return '只有房主可以分配企業。';
+      if (this.lobby.status !== 'waiting') return '對局已開始，不能換企業。';
+      const player = this.lobby.players.find(p => p.peerId === peerId);
+      if (!player || typeof roleId !== 'string' || !roleId || roleId.length > 40) return '找不到這位玩家或企業。';
+      const taker = roleId !== 'random' && this.lobby.players.find(p => p.peerId !== peerId && p.roleId === roleId);
+      if (taker) return `這家企業已經被「${taker.name}」選走了，請選別家。`;
+      player.roleId = roleId;
+      this.broadcastLobby();
+      return null;
     }
 
     renameSelf(name) {
@@ -471,8 +484,8 @@ export const PartyNet = (() => {
         return;
       }
       if (msg.t === 'role' && this.host) {
-        const p = this.lobby.players.find(x => x.peerId === fromPeer);
-        if (p) { p.roleId = msg.roleId; this.broadcastLobby(); }
+        const error = this.assignRole(fromPeer, msg.roleId);
+        if (error) { this.sendData({ t: 'error', text: error }, fromPeer); this.sendData({ t: 'lobby', lobby: this.lobby }, fromPeer); }
         return;
       }
       if (msg.t === 'rename' && this.host) {
