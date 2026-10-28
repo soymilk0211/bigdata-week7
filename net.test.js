@@ -150,3 +150,227 @@ test('掃 QR Code 打開的網址可以讀回房間代碼', () => {
   assert.equal(roomCodeFromLink('https://soymilk0211.github.io/bigdata-week7/?room=%20abc%20'), 'abc');
   assert.equal(roomCodeFromLink('not a url'), '');
 });
+
+// ---- 有人離開大廳／斷線 -------------------------------------------------
+function withHost(run) {
+  const previousPeer = globalThis.Peer;
+  globalThis.Peer = FakePeer;
+  const errors = [];
+  PartyNet.onError = text => errors.push(text);
+  try {
+    PartyNet.createRoom({name: '房主'});
+    const hostPeer = FakePeer.last;
+    hostPeer.emit('open', 'host-peer-id');
+    const join = (peerId, name) => {
+      const connection = new FakeConnection(peerId);
+      hostPeer.emit('connection', connection);
+      connection.emit('open');
+      connection.emit('data', {t: 'hello', name});
+      return connection;
+    };
+    run({join, errors});
+  } finally {
+    PartyNet.leave(false);
+    PartyNet.onError = null;
+    PartyNet.onStart = null;
+    if (previousPeer === undefined) delete globalThis.Peer;
+    else globalThis.Peer = previousPeer;
+  }
+}
+const names = () => PartyNet.lobby.players.map(p => p.name);
+
+test('開始前客機離開或斷線，房主馬上把他移出大廳', () => {
+  withHost(({join}) => {
+    const a = join('guest-a', '小明');
+    const b = join('guest-b', '阿華');
+    assert.deepEqual(names(), ['房主', '小明', '阿華']);
+    a.emit('data', {t: 'leave'});
+    assert.deepEqual(names(), ['房主', '阿華']);
+    b.emit('close');
+    assert.deepEqual(names(), ['房主']);
+    // 同一個人用新的頁面（新的 Peer ID）回來，只會有一筆
+    join('guest-a2', '小明');
+    assert.deepEqual(names(), ['房主', '小明']);
+  });
+});
+
+test('名字重複時自動加上編號，開局不會因為名字重複而失敗', () => {
+  withHost(({join}) => {
+    join('guest-a', '玩家 1');
+    join('guest-b', '玩家 1');
+    const c = join('guest-c', ' 房主 ');
+    assert.deepEqual(names(), ['房主', '玩家 1', '玩家 1 2', '房主 2']);
+    c.emit('data', {t: 'rename', name: '玩家 1'});
+    assert.equal(names()[3], '玩家 1 3');
+    let config = null;
+    PartyNet.onStart = value => { config = value; };
+    PartyNet.startGame();
+    assert.equal(new Set(config.players.map(p => p.name)).size, 4);
+  });
+});
+
+test('房主 12 秒沒收到客機訊息就標成已離線，收到訊息後恢復；開始時已離線的人不加入', () => {
+  withHost(({join}) => {
+    const a = join('guest-a', '小明');
+    const b = join('guest-b', '阿華');
+    const t0 = Date.now();
+    for (let t = t0 + 3000; t <= t0 + 15000; t += 3000) {
+      PartyNet.lastSeen.set('guest-a', t);  // 小明每 3 秒有 ping
+      PartyNet.beat(t);
+    }
+    assert.deepEqual(PartyNet.lobby.players.map(p => p.connected !== false), [true, true, false]);
+    b.emit('data', {t: 'ping'});
+    assert.equal(PartyNet.lobby.players[2].connected, true);
+    PartyNet.lobby.players[2].connected = false;
+
+    let config = null;
+    PartyNet.onStart = value => { config = value; };
+    PartyNet.startGame();
+    assert.deepEqual(config.players.map(p => p.name), ['房主', '小明']);
+    assert.deepEqual(Object.values(config.net.owners), ['host-peer-id', 'guest-a']);
+    assert.deepEqual(names(), ['房主', '小明']);
+    assert.equal(b.sent.at(-1).t, 'refused');
+    assert.match(b.sent.at(-1).text, /你剛才離線/);
+    assert.equal(b.sent.some(m => m.t === 'start'), false);
+    assert.equal(a.sent.some(m => m.t === 'start'), true);
+  });
+});
+
+test('房主的頁面在背景停過時，先不判斷誰離線', () => {
+  withHost(({join}) => {
+    join('guest-a', '小明');
+    PartyNet.beat(Date.now() + 60000);
+    assert.equal(PartyNet.lobby.players[1].connected, true);
+  });
+});
+
+test('只剩 1 位在線玩家時不能開始；第 9 位加入會被拒絕', () => {
+  withHost(({join}) => {
+    const a = join('guest-a', '小明');
+    PartyNet.lobby.players[1].connected = false;
+    assert.throws(() => PartyNet.startGame(), /至少需要 2 位在線玩家/);
+    assert.equal(PartyNet.lobby.status, 'waiting');
+    PartyNet.lobby.players[1].connected = true;
+    for (let i = 2; i <= 7; i++) join(`guest-${i}`, `玩家${i}`);
+    assert.equal(PartyNet.lobby.players.length, 8);
+    const ninth = join('guest-9', '第九位');
+    assert.equal(PartyNet.lobby.players.length, 8);
+    assert.equal(ninth.sent.at(-1).t, 'refused');
+    assert.match(ninth.sent.at(-1).text, /房間已滿/);
+    assert.equal(a.open, true);
+  });
+});
+
+test('季數限制在 3–30，避免建立棋盤失敗', () => {
+  withHost(() => {
+    PartyNet.setRounds(99);
+    assert.equal(PartyNet.lobby.rounds, 30);
+    PartyNet.setRounds(1);
+    assert.equal(PartyNet.lobby.rounds, 3);
+    PartyNet.setRounds('abc');
+    assert.equal(PartyNet.lobby.rounds, 10);
+  });
+});
+
+test('建立棋盤失敗時大家回到大廳並看到原因', () => {
+  withHost(({join, errors}) => {
+    const a = join('guest-a', '小明');
+    PartyNet.startGame();
+    assert.equal(PartyNet.lobby.status, 'playing');
+    PartyNet.cancelStart('季數上限須為 2–30。');
+    assert.equal(PartyNet.lobby.status, 'waiting');
+    assert.deepEqual(errors, ['無法開始對局：季數上限須為 2–30。']);
+    assert.equal(a.sent.at(-1).text, '無法開始對局：季數上限須為 2–30。');
+    assert.equal(a.sent.findLast(m => m.t === 'lobby').lobby.status, 'waiting');
+  });
+});
+
+test('對局中有人斷線只標成已離線；結算確認不用等他，回大廳時移出', () => {
+  withHost(({join}) => {
+    const a = join('guest-a', '小明');
+    const b = join('guest-b', '阿華');
+    PartyNet.startGame();
+    b.emit('close');
+    assert.deepEqual(names(), ['房主', '小明', '阿華']);
+    assert.equal(PartyNet.lobby.players[2].connected, false);
+    assert.deepEqual(PartyNet.confirmResult('player-1'), {confirmed: 1, total: 2});
+    let back = false;
+    PartyNet.onReturnLobby = () => { back = true; };
+    a.emit('data', {t: 'confirm', playerId: 'player-2'});
+    assert.equal(back, true);
+    assert.equal(PartyNet.lobby.status, 'waiting');
+    assert.deepEqual(names(), ['房主', '小明']);
+    assert.equal(b.sent.some(m => m.t === 'refused'), false);  // 連線已經關了，不用再通知
+    PartyNet.onReturnLobby = null;
+  });
+});
+
+test('等確認結果時最後一位沒確認的人離開，不會卡住', () => {
+  withHost(({join}) => {
+    const a = join('guest-a', '小明');
+    const b = join('guest-b', '阿華');
+    PartyNet.startGame();
+    PartyNet.confirmResult('player-1');
+    a.emit('data', {t: 'confirm', playerId: 'player-2'});
+    assert.equal(PartyNet.lobby.status, 'playing');
+    b.emit('data', {t: 'leave'});
+    assert.equal(PartyNet.lobby.status, 'waiting');
+    assert.deepEqual(names(), ['房主', '小明']);
+  });
+});
+
+function withGuest(run) {
+  const previousPeer = globalThis.Peer;
+  globalThis.Peer = FakePeer;
+  const errors = [];
+  let lost = null;
+  PartyNet.onError = text => errors.push(text);
+  PartyNet.onHostLost = (code, name) => { lost = `${code}/${name}`; };
+  try {
+    PartyNet.joinRoom('host-peer-id', '小明');
+    FakePeer.last.emit('open', 'guest-a');
+    const connection = FakePeer.last.connection;
+    connection.emit('open');
+    run({connection, errors, lost: () => lost});
+  } finally {
+    PartyNet.leave(false);
+    PartyNet.onError = null;
+    PartyNet.onHostLost = null;
+    if (previousPeer === undefined) delete globalThis.Peer;
+    else globalThis.Peer = previousPeer;
+  }
+}
+
+test('客機離開時先通知房主，並定時送 ping', () => {
+  withGuest(({connection}) => {
+    assert.equal(connection.sent[0].t, 'hello');
+    PartyNet.beat();
+    assert.equal(connection.sent.at(-1).t, 'ping');
+    PartyNet.leave(false);
+    assert.equal(connection.sent.at(-1).t, 'leave');
+    assert.equal(PartyNet.active, false);
+  });
+});
+
+test('開始前和房主斷線：回到加入畫面並帶著代碼', () => {
+  withGuest(({connection, errors, lost}) => {
+    connection.emit('close');
+    assert.equal(PartyNet.active, false);
+    assert.equal(lost(), 'host-peer-id/小明');
+    assert.deepEqual(errors, ['和房主的連線中斷了，請重新加入。']);
+  });
+});
+
+test('房主關閉房間或拒絕加入時，客機離開房間並看到原因', () => {
+  withGuest(({connection, errors, lost}) => {
+    connection.emit('data', {t: 'closed'});
+    assert.equal(PartyNet.active, false);
+    assert.equal(lost(), null);
+    assert.deepEqual(errors, ['房主已關閉房間。']);
+  });
+  withGuest(({connection, errors}) => {
+    connection.emit('data', {t: 'refused', text: '對局已開始，暫時無法加入。'});
+    assert.equal(PartyNet.active, false);
+    assert.deepEqual(errors, ['對局已開始，暫時無法加入。']);
+  });
+});

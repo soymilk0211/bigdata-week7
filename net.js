@@ -1,6 +1,12 @@
 // 多人房間 / PeerJS P2P 連線層
 export const PartyNet = (() => {
   const rid = () => (globalThis.crypto?.randomUUID?.() || `p-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`);
+  // 客機每 3 秒送一次 ping；房主 12 秒沒收到任何訊息就把該玩家標成「已離線」（手機鎖螢幕或直接關頁時 PeerJS 常常不會發出 close）。
+  const PING_MS = 3000;
+  const OFFLINE_MS = 12000;
+  const MAX_PLAYERS = 8;
+  const cleanName = (name, fallback) => String(name ?? '').replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, 16) || fallback;
+  const isOnline = p => p.host || p.connected !== false;
 
   class Net {
     constructor() {
@@ -14,7 +20,10 @@ export const PartyNet = (() => {
       this.connectedPeers = new Set();
       this.peers = new Map();
       this.seen = new Set();
+      this.lastSeen = new Map();
       this._peer = null;
+      this._beat = null;
+      this._lastBeat = 0;
       this.onLobby = null;
       this.onStart = null;
       this.onState = null;
@@ -23,6 +32,7 @@ export const PartyNet = (() => {
       this.onReturnLobby = null;
       this.onStatus = null;
       this.onError = null;
+      this.onHostLost = null;
     }
 
     get isHost() { return this.host; }
@@ -40,7 +50,7 @@ export const PartyNet = (() => {
       if (typeof PeerConstructor !== 'function') throw Error('PeerJS 尚未載入，請確認網路連線後重新整理。');
       this.host = true;
       this.active = true;
-      this.name = name || '房主';
+      this.name = cleanName(name, '房主');
       this.lobby = {
         code: '', hostId: '', status: 'waiting', mode: 'star', rounds: 10, target: 0,
         starGoal: 3, doomEvery: 5, doomPrice: 1000, doomStep: 500, debug: false,
@@ -59,6 +69,7 @@ export const PartyNet = (() => {
         this.lobby.players = [{ peerId, name: this.name, roleId, host: true, connected: true }];
         this.emitLobby();
         this.broadcastLobby();
+        this.startBeat();
         this.status(`房間 ${this.code} 已建立，等待玩家加入。`);
       });
       peer.on('connection', conn => this.wireConnection(conn));
@@ -77,7 +88,7 @@ export const PartyNet = (() => {
       this.host = false;
       this.hostId = this.code;
       this.active = true;
-      this.name = name || '玩家';
+      this.name = cleanName(name, '玩家');
       this.lobby = {
         code: this.code, hostId: this.hostId, status: 'waiting', mode: 'star', rounds: 10, target: 0,
         starGoal: 3, doomEvery: 5, doomPrice: 1000, doomStep: 500, debug: false,
@@ -98,11 +109,16 @@ export const PartyNet = (() => {
     }
 
     leave(notify = true) {
+      // 先告訴對方：客機離開大廳，或房主關閉房間（直接斷線時對方可能很久才發現）。
+      if (this.active) this.sendData({ t: this.host ? 'closed' : 'leave' }, this.host ? 'all' : this.hostId);
       this.active = false;
+      clearInterval(this._beat);
+      this._beat = null;
       for (const rec of this.peers.values()) { try { rec.conn?.close(); } catch { } }
       try { this._peer?.destroy(); } catch { }
       this.peers.clear();
       this.connectedPeers.clear();
+      this.lastSeen.clear();
       this._peer = null;
       this.host = false;
       this.code = '';
@@ -116,9 +132,11 @@ export const PartyNet = (() => {
         if (!conn?.peer) return;
         const peerId = conn.peer;
         this.peers.set(peerId, { conn });
+        const current = () => this.active && this.peers.get(peerId)?.conn === conn;
         conn.on('open', () => {
-          if (!this.active) return;
+          if (!current()) return;
           this.connectedPeers.add(peerId);
+          this.lastSeen.set(peerId, Date.now());
           if (this.host) {
             const player = this.lobby?.players.find(entry => entry.peerId === peerId);
             if (player) player.connected = true;
@@ -127,10 +145,13 @@ export const PartyNet = (() => {
             this.status(`${peerId} 已連線。`);
           } else {
             this.sendData({ t: 'hello', name: this.name }, this.hostId);
+            this.startBeat();
             this.status('PeerJS 已連線。');
           }
         });
         conn.on('data', data => {
+          if (!current()) return;
+          this.heard(peerId);
           let message = data;
           if (typeof message === 'string') {
             try { message = JSON.parse(message); } catch { return; }
@@ -142,13 +163,12 @@ export const PartyNet = (() => {
           this.handleData(message, peerId);
         });
         conn.on('close', () => {
+          if (!current()) return;
           this.connectedPeers.delete(peerId);
           this.peers.delete(peerId);
-          const player = this.lobby?.players.find(entry => entry.peerId === peerId);
-          if (player) {
-            player.connected = false;
-            if (this.host) this.broadcastLobby();
-          }
+          this.lastSeen.delete(peerId);
+          if (this.host) this.playerGone(peerId);
+          else if (peerId === this.hostId) this.hostGone();
         });
         conn.on('error', error => this.error(error?.message || 'PeerJS 資料連線錯誤'));
     }
@@ -157,11 +177,89 @@ export const PartyNet = (() => {
       if (!this.host || !this.lobby) return;
       let player = this.lobby.players.find(p => p.peerId === peerId);
       if (!player) {
-        if (this.lobby.status !== 'waiting') { this.sendData({ t: 'error', text: '對局已開始，暫時無法加入。' }, peerId); return; }
-        player = { peerId, name, roleId: 'random', host: false, connected: false };
+        if (this.lobby.status !== 'waiting') { this.refuse(peerId, '對局已開始，暫時無法加入。'); return; }
+        if (this.lobby.players.length >= MAX_PLAYERS) { this.refuse(peerId, `房間已滿（最多 ${MAX_PLAYERS} 人）。`); return; }
+        player = { peerId, name: this.uniqueName(cleanName(name, '玩家'), peerId), roleId: 'random', host: false, connected: true };
         this.lobby.players.push(player);
-      } else if (name) player.name = name;
+      } else if (name) player.name = this.uniqueName(cleanName(name, player.name), peerId);
       this.emitLobby();
+    }
+
+    // 名字重複時加上編號（開局時名字不能重複）。
+    uniqueName(name, peerId) {
+      const taken = new Set((this.lobby?.players || []).filter(p => p.peerId !== peerId).map(p => p.name));
+      if (!taken.has(name)) return name;
+      for (let n = 2; ; n++) {
+        const next = `${name.slice(0, 13)} ${n}`;
+        if (!taken.has(next)) return next;
+      }
+    }
+
+    // 房主拒絕加入：通知對方後不再廣播給他，對方收到後會自己斷線。
+    refuse(peerId, text) {
+      this.sendData({ t: 'refused', text }, peerId);
+      const rec = this.peers.get(peerId);
+      this.peers.delete(peerId);
+      this.connectedPeers.delete(peerId);
+      this.lastSeen.delete(peerId);
+      setTimeout(() => { try { rec?.conn?.close(); } catch { } }, 1000)?.unref?.();
+    }
+
+    // 房主：玩家離開或斷線。開始前直接移出大廳；對局中只標成已離線（座位還在）。
+    playerGone(peerId) {
+      const player = this.lobby?.players.find(p => p.peerId === peerId);
+      if (!player || player.host) return;
+      if (this.lobby.status === 'waiting') this.dropPlayer(peerId);
+      else player.connected = false;
+      this.broadcastLobby();
+      this.recheckConfirms();
+    }
+
+    dropPlayer(peerId) {
+      const rec = this.peers.get(peerId);
+      this.peers.delete(peerId);
+      this.connectedPeers.delete(peerId);
+      this.lastSeen.delete(peerId);
+      if (this.lobby) this.lobby.players = this.lobby.players.filter(p => p.host || p.peerId !== peerId);
+      try { rec?.conn?.close(); } catch { }
+    }
+
+    // 客機：和房主的連線沒了。開始前回到加入畫面（帶著代碼）；對局中只提示。
+    hostGone() {
+      if (this.lobby?.status === 'playing') { this.error('和房主的連線中斷了，對局無法繼續同步。'); return; }
+      const code = this.code, name = this.name;
+      this.leave();
+      this.error('和房主的連線中斷了，請重新加入。');
+      this.onHostLost?.(code, name);
+    }
+
+    heard(peerId) {
+      this.lastSeen.set(peerId, Date.now());
+      if (!this.host) return;
+      const player = this.lobby?.players.find(p => p.peerId === peerId);
+      if (player && player.connected === false) { player.connected = true; this.broadcastLobby(); }
+    }
+
+    startBeat() {
+      clearInterval(this._beat);
+      this._lastBeat = Date.now();
+      this._beat = setInterval(() => this.beat(), PING_MS);
+      this._beat?.unref?.();
+    }
+
+    beat(now = Date.now()) {
+      if (!this.active) return;
+      const paused = now - this._lastBeat > PING_MS * 3;
+      this._lastBeat = now;
+      if (!this.host) { this.sendData({ t: 'ping' }, this.hostId); return; }
+      // 房主頁面剛從背景回來時計時器停過，先不判斷，等下一輪。
+      if (paused) return;
+      let changed = false;
+      for (const p of this.lobby?.players || []) {
+        if (!isOnline(p)) continue;
+        if (now - (this.lastSeen.get(p.peerId) ?? now) > OFFLINE_MS) { p.connected = false; changed = true; }
+      }
+      if (changed) { this.broadcastLobby(); this.recheckConfirms(); }
     }
 
     setMode(mode) {
@@ -169,7 +267,7 @@ export const PartyNet = (() => {
       this.lobby.mode = mode;
       this.broadcastLobby();
     }
-    setRounds(rounds) { if (!this.host || !this.lobby) return; this.lobby.rounds = Number(rounds) || 10; this.broadcastLobby(); }
+    setRounds(rounds) { if (!this.host || !this.lobby) return; this.lobby.rounds = Math.min(30, Math.max(3, Math.round(Number(rounds)) || 10)); this.broadcastLobby(); }
     setDebug(debug) { if (!this.host || !this.lobby) return; this.lobby.debug = Boolean(debug); this.broadcastLobby(); }
     setTarget(target) { if (!this.host || !this.lobby) return; this.lobby.target = Number(target) || 0; this.broadcastLobby(); }
     setStarGoal(goal) { if (!this.host || !this.lobby) return; this.lobby.starGoal = Math.max(1, Number(goal) || 3); this.broadcastLobby(); }
@@ -189,16 +287,20 @@ export const PartyNet = (() => {
 
     renameSelf(name) {
       if (!this.active) return;
-      if (this.host) { const p = this.myPlayer; if (p) p.name = name; this.broadcastLobby(); }
+      if (this.host) { const p = this.myPlayer; if (p) p.name = this.uniqueName(cleanName(name, p.name), p.peerId); this.broadcastLobby(); }
       else if (this.hostId) this.sendData({ t: 'rename', name }, this.hostId);
     }
 
     startGame() {
       if (!this.host || !this.lobby) throw Error('只有房主可以開始對局。');
-      if (this.lobby.players.length < 2) throw Error('至少需要 2 位玩家。');
-      if (this.lobby.players.length > 8) throw Error('最多 8 位玩家。');
-      const fixed = this.lobby.players.filter(p => p.roleId !== 'random').map(p => p.roleId);
+      const online = this.lobby.players.filter(isOnline);
+      if (online.length < 2) throw Error('至少需要 2 位在線玩家。');
+      if (online.length > MAX_PLAYERS) throw Error(`最多 ${MAX_PLAYERS} 位玩家。`);
+      const fixed = online.filter(p => p.roleId !== 'random').map(p => p.roleId);
       if (new Set(fixed).size !== fixed.length) throw Error('企業角色不可重複（未定新創集團除外）。');
+      // 已離線的玩家不加入這局，否則輪到他時整局會卡住；他回來時會看到原因。
+      for (const p of this.lobby.players) if (!isOnline(p)) this.refuse(p.peerId, '對局已經開始；你剛才離線，沒有加入這局。');
+      this.lobby.players = online;
       this.lobby.status = 'playing';
       this.lobby.confirms = [];
       const config = {
@@ -221,6 +323,16 @@ export const PartyNet = (() => {
       this.broadcastData({ t: 'start', config });
       this.broadcastLobby();
       this.onStart?.(config);
+    }
+
+    // 房主建立棋盤失敗時，讓大家回到大廳並顯示原因（不然客機會一直停在「初始化中」）。
+    cancelStart(reason) {
+      if (!this.host || !this.lobby) return;
+      this.lobby.status = 'waiting';
+      this.broadcastLobby();
+      const text = `無法開始對局：${reason}`;
+      this.broadcastData({ t: 'error', text });
+      this.error(text);
     }
 
     publish(state) {
@@ -274,6 +386,7 @@ export const PartyNet = (() => {
       if (!msg || typeof msg !== 'object') return;
       if (msg.type === 'SYSTEM') { console.log(msg.message); return; }
       if (msg.fromPeer === this.peerId) return;
+      if (msg.t === 'ping') return;
       if (this._markSeen(msg.mid)) return;
       if (msg.t === 'lobby' && msg.lobby) {
         this.lobby = msg.lobby;
@@ -316,7 +429,7 @@ export const PartyNet = (() => {
       }
       if (msg.t === 'rename' && this.host) {
         const p = this.lobby.players.find(x => x.peerId === fromPeer);
-        if (p && msg.name) { p.name = String(msg.name).slice(0, 16); this.broadcastLobby(); }
+        if (p && msg.name) { p.name = this.uniqueName(cleanName(msg.name, p.name), p.peerId); this.broadcastLobby(); }
         return;
       }
       if (msg.t === 'confirm' && this.host) {
@@ -331,6 +444,14 @@ export const PartyNet = (() => {
         this.onReturnLobby?.(this.lobby);
         return;
       }
+      if (msg.t === 'leave' && this.host) { this.playerGone(fromPeer); return; }
+      if (msg.t === 'closed' && !this.host && fromPeer === this.hostId) {
+        const playing = this.lobby?.status === 'playing';
+        this.leave();
+        this.error(playing ? '房主已關閉房間，對局結束。' : '房主已關閉房間。');
+        return;
+      }
+      if (msg.t === 'refused' && !this.host && fromPeer === this.hostId) { this.leave(); this.error(msg.text || '無法加入房間。'); return; }
       if (msg.t === 'error') { this.error(msg.text || '連線錯誤'); return; }
     }
 
@@ -352,10 +473,14 @@ export const PartyNet = (() => {
       }
       if (!this.lobby) return null;
       if (playerId && !this.lobby.confirms.includes(playerId)) this.lobby.confirms.push(playerId);
-      const total = this.lobby.players.length;
-      const confirmed = this.lobby.players.filter((p, i) => this.lobby.confirms.includes(`player-${i + 1}`) || this.lobby.confirms.includes(p.peerId)).length;
+      // 已離線的玩家不用確認；回到大廳時把他們移出。
+      const online = this.lobby.players.filter(isOnline);
+      const total = online.length;
+      const confirmed = online.filter(p => { const i = this.lobby.players.indexOf(p); return this.lobby.confirms.includes(`player-${i + 1}`) || this.lobby.confirms.includes(p.peerId); }).length;
       this.lobby.confirmRatio = { confirmed, total };
       if (confirmed >= total) {
+        for (const p of this.lobby.players) if (!isOnline(p)) this.refuse(p.peerId, '你剛才離線，已移出房間；要再玩請重新加入。');
+        this.lobby.players = online;
         this.lobby.status = 'waiting';
         this.lobby.confirms = [];
         this.lobby.confirmRatio = { confirmed: 0, total };
@@ -366,6 +491,11 @@ export const PartyNet = (() => {
         this.broadcastLobby();
       }
       return this.lobby.confirmRatio;
+    }
+
+    // 等待確認結果時有人離線，重新計算（最後一位沒確認的人離開時不會卡住）。
+    recheckConfirms() {
+      if (this.host && this.lobby?.status === 'playing' && this.lobby.confirms?.length) this.confirmResult('');
     }
 
     // ---- 權限 -----------------------------------------------------------

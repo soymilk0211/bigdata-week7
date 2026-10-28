@@ -227,12 +227,12 @@ export const PartyUI = (() => {
     }
   }
 
-  function openConnect(kind, presetCode = '') {
+  function openConnect(kind, presetCode = '', presetName = '') {
     const el = $('#party-connect');
     if (!el) return;
     const roles = window.__partyData?.LOBBY_ROLES || [];
-    const selfName = document.querySelector('[data-setup-name="0"]')?.value || '玩家 1';
-    const joinCopy = presetCode ? '已從 QR Code 帶入房間代碼，輸入你的名稱後按「加入房間」。' : '向房主取得 6 碼房間代碼，加入後在大廳選擇企業。';
+    const selfName = presetName || document.querySelector('[data-setup-name="0"]')?.value || '玩家 1';
+    const joinCopy = presetCode ? '已帶入房間代碼，輸入你的名稱後按「加入房間」。' : '向房主取得 6 碼房間代碼，加入後在大廳選擇企業。';
     el.innerHTML = `
       <div class="ext-modal-backdrop"></div>
       <div class="connect-card">
@@ -292,6 +292,10 @@ export const PartyUI = (() => {
       const visible = allowed.includes(key);
       return `<label data-lobby-field="${key}" class="${visible ? '' : 'hidden'}">${label}<input id="${id}" type="number" ${extra} value="${value}" ${isHost && visible ? '' : 'disabled'}></label>`;
     };
+    const online = lobby.players.filter(p => p.host || p.connected !== false);
+    const offline = lobby.players.filter(p => !p.host && p.connected === false).map(p => `「${h(p.name)}」`).join('、');
+    const hostStatus = online.length < 2 ? '等待至少 1 位玩家加入…'
+      : offline ? `可以開始；${offline}已離線，開始時不會加入對局。` : '全員到齊，可以開始！';
     const invite = roomInviteLink(location.href, lobby.code);
     const qr = qrSvg(invite);
     const qrBlock = qr
@@ -310,9 +314,9 @@ export const PartyUI = (() => {
             ${lobby.players.map((p, i) => {
               const isMe = p.peerId === net?.peerId;
               const role = roles.find(r => r.id === p.roleId) || roles[0];
-              return `<div class="lobby-player ${p.host ? 'host' : ''} ${isMe ? 'me' : ''}">
+              return `<div class="lobby-player ${p.host ? 'host' : ''} ${isMe ? 'me' : ''} ${p.connected === false ? 'offline' : ''}">
                 <span class="lobby-avatar">${role?.icon || '🎲'}</span>
-                <div class="lobby-player-main"><strong>${h(p.name)}${p.host ? ' 👑' : ''}${isMe ? '（你）' : ''}</strong><small>${h(role?.name || '未定新創集團')}${p.connected === false ? ' · 連線中…' : ' · 已連線'}</small></div>
+                <div class="lobby-player-main"><strong>${h(p.name)}${p.host ? ' 👑' : ''}${isMe ? '（你）' : ''}</strong><small>${h(role?.name || '未定新創集團')}${p.connected === false ? ' · 已離線' : ' · 已連線'}</small></div>
                 ${(isMe || isHost) ? `<select data-lobby-role="${i}" class="lobby-role-select" ${isMe || isHost ? '' : 'disabled'}>${roles.map(r => `<option value="${r.id}" ${r.id === p.roleId ? 'selected' : ''}>${r.icon} ${h(r.name)}</option>`).join('')}</select>` : `<span class="lobby-role">${h(role?.name || '')}</span>`}
               </div>`;
             }).join('')}
@@ -337,8 +341,8 @@ export const PartyUI = (() => {
           </div>
         </div>
         <div class="lobby-footer">
-          <span id="lobby-status">${isHost ? (lobby.players.length < 2 ? '等待至少 1 位玩家加入…' : '全員到齊，可以開始！') : '等待房主開始對局…'}</span>
-          ${isHost ? `<button class="primary" id="lobby-start" type="button" ${lobby.players.length < 2 ? 'disabled' : ''}>開始對局 →</button>` : `<span class="waiting-dot">等待房主</span>`}
+          <span id="lobby-status">${isHost ? hostStatus : '等待房主開始對局…'}</span>
+          ${isHost ? `<button class="primary" id="lobby-start" type="button" ${online.length < 2 ? 'disabled' : ''}>開始對局 →</button>` : `<span class="waiting-dot">等待房主</span>`}
         </div>
       </div>
     `;
@@ -1864,6 +1868,7 @@ export const PartyUI = (() => {
 
   return {
     init, renderSetupExtras, showLobby, hideLobby, onGameStart, afterRender,
+    openJoin: (code, name) => openConnect('join', code, name),
     openSettlement, hideSettlement, openTilePicker, openTruthGate, openWheel: showWheel, openFateDice,
     closeExtModal, openDebugItemPicker, updateConfirm, clearTurnLock,
     playGhostInterference: flashGhostInterference, playSkillCue,

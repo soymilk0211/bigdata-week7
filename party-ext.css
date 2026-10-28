@@ -264,6 +264,7 @@
 .lobby-qr-code svg { display: block; width: 100%; height: 100%; }
 .lobby-qr small { font-size: 11.5px; line-height: 1.5; color: #7d8c88; max-width: 220px; }
 .lobby-qr-note { font-size: 11px; color: #7d8c88; margin: 6px 0 0; }
+.lobby-player.offline { opacity: .55; }
 .lobby-grid {
   display: grid;
   grid-template-columns: minmax(0, 1.15fr) minmax(260px, .85fr);

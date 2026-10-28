@@ -747,7 +747,7 @@ PartyNet.onLobby = lobby => {
   }catch(e){console.error(e)}
 };
 PartyNet.onStart = config => {
-  if(PartyNet.isHost)void startGameFromConfig(config);
+  if(PartyNet.isHost)startGameFromConfig(config).catch(e=>{console.error(e);PartyNet.cancelStart(e?.message||'建立棋盤失敗。')});
   else $('#save-status').textContent='房主正在初始化棋盤…';
 };
 PartyNet.onState = (game,fromPeer) => {
@@ -848,6 +848,10 @@ PartyNet.onEvent = event => {
 PartyNet.onReturnLobby = lobby => { PartyUI.hideSettlement?.();returnToLobby(lobby); };
 PartyNet.onStatus = text => { const el=$('#save-status');if(el)el.textContent=text; };
 PartyNet.onError = text => notify(text);
+// 開始前和房主斷線：回到加入畫面，代碼和名字已填好，按一下就能重新加入。
+PartyNet.onHostLost = (code,name) => { PartyUI.hideLobby?.(); PartyUI.openJoin?.(code,name); };
+// 關閉或離開頁面時先通知房主，讓房主馬上把你移出大廳。
+window.addEventListener('pagehide',()=>{if(PartyNet.active)PartyNet.leave(false)});
 
 window.PartyApp={
   get state(){return state},
